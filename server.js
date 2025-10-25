@@ -1,4 +1,6 @@
 // server.js
+// خادم مزامنة مبسّط للفواتير — متوافق مع الواجهة الحالية
+
 import express from "express";
 import mongoose from "mongoose";
 import cors from "cors";
@@ -10,24 +12,24 @@ dotenv.config();
 
 const app = express();
 
-// ---------- Middlewares ----------
-app.use(cors());                 // افتحها للكل. تقدر تحدد origin لاحقًا
-app.use(express.json({ limit: "1mb" })); // JSON body
+// ===== الوسطاء =====
+app.use(cors()); // كل الأصول مسموحة
+app.use(express.json({ limit: "5mb" })); // JSON body
 
-// ---------- اتصال MongoDB ----------
+// ===== اتصال MongoDB =====
 const MONGO_URI = process.env.MONGO_URI;
 if (!MONGO_URI) {
-  console.error("❌ MONGO_URI مفقود في .env");
+  console.error("❌ MONGO_URI مفقود في متغيرات البيئة");
   process.exit(1);
 }
 
 await mongoose.connect(MONGO_URI, {
-  // مع Mongoose 8 ما تحتاج useNewUrlParser/useUnifiedTopology
+  // منذ Mongoose 8 الخيارات الافتراضية جيدة
   dbName: "ejarat_sync",
 });
-console.log("✅ تم الاتصال بقاعدة MongoDB Atlas");
+console.log("✅ تم الاتصال بـ MongoDB");
 
-// ---------- نماذج (Schemas) ----------
+// ===== النماذج =====
 const userSchema = new mongoose.Schema(
   {
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
@@ -37,74 +39,72 @@ const userSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-const invoiceSchema = new mongoose.Schema(
+const snapshotSchema = new mongoose.Schema(
   {
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true },
-    title: String,
-    amount: Number,
-    month: String,   // مثال: "2025-10"
-    notes: String,
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", index: true, required: true },
+    data: { type: Object, default: {} }, // نخزن الـ DB كاملاً ككائن
   },
   { timestamps: true }
 );
 
 const User = mongoose.model("User", userSchema);
-const Invoice = mongoose.model("Invoice", invoiceSchema);
+const Snapshot = mongoose.model("Snapshot", snapshotSchema);
 
-// ---------- أدوات JWT ----------
-const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
-const signToken = (user) =>
-  jwt.sign({ sub: user._id.toString(), email: user.email }, JWT_SECRET, {
+// ===== JWT =====
+const JWT_SECRET = process.env.JWT_SECRET || "change_me_now";
+function signToken(user) {
+  // نضع المعرف في الـ sub
+  return jwt.sign({ sub: user._id.toString(), email: user.email, name: user.name }, JWT_SECRET, {
     expiresIn: "30d",
   });
+}
 
-const auth = (req, res, next) => {
-  // توقع Authorization: Bearer <token>
+function auth(req, res, next) {
   try {
     const h = req.headers.authorization || "";
     const token = h.startsWith("Bearer ") ? h.slice(7) : null;
-    if (!token) return res.status(401).json({ error: "مطلوب تسجيل الدخول" });
+    if (!token) return res.status(401).json({ error: "مطلوب توكن" });
     const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload;
+    req.user = payload; // { sub, email, name, iat, exp }
     next();
-  } catch {
-    return res.status(401).json({ error: "جلسة غير صالحة" });
+  } catch (e) {
+    return res.status(401).json({ error: "توكن غير صالح" });
   }
-};
+}
 
-// ---------- Routes بسيطة ----------
-app.get("/", (_req, res) => {
-  res.json({ ok: true, msg: "ejarat-sync API شغال" });
+// ===== مسارات عامة =====
+app.get("/", (req, res) => {
+  res.json({ ok: true, msg: "ejarat-sync API شغّال" });
 });
 
-// تسجيل مستخدم جديد
-app.post("/api/auth/signup", async (req, res) => {
+app.get("/healthz", (req, res) => {
+  res.json({ ok: true, msg: "Server working fine ✅" });
+});
+
+// ===== التسجيل والدخول =====
+app.post("/auth/register", async (req, res) => {
   try {
-    const { email, password, name = "" } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: "أدخل البريد وكلمة المرور" });
+    const { email, password, name } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: "أدخل الإيميل وكلمة السر" });
 
     const exists = await User.findOne({ email: email.toLowerCase() });
-    if (exists) return res.status(409).json({ error: "البريد مسجل من قبل" });
+    if (exists) return res.status(409).json({ error: "المستخدم موجود مسبقاً" });
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const user = await User.create({ email, name, passwordHash });
-    const token = signToken(user);
+    const user = await User.create({ email: email.toLowerCase(), name: name || "", passwordHash });
 
-    res.status(201).json({
-      token,
-      user: { id: user._id, email: user.email, name: user.name },
-    });
+    const token = signToken(user);
+    res.status(201).json({ token, user: { id: user._id, email: user.email, name: user.name } });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "خطأ في السيرفر" });
+    res.status(500).json({ error: "فشل التسجيل" });
   }
 });
 
-// تسجيل الدخول
-app.post("/api/auth/login", async (req, res) => {
+app.post("/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: "أدخل البريد وكلمة المرور" });
+    if (!email || !password) return res.status(400).json({ error: "أدخل الإيميل وكلمة السر" });
 
     const user = await User.findOne({ email: email.toLowerCase() });
     if (!user) return res.status(401).json({ error: "بيانات غير صحيحة" });
@@ -116,36 +116,47 @@ app.post("/api/auth/login", async (req, res) => {
     res.json({ token, user: { id: user._id, email: user.email, name: user.name } });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "خطأ في السيرفر" });
+    res.status(500).json({ error: "تعذر تسجيل الدخول" });
   }
 });
 
-// معلومات المستخدم الحالي
-app.get("/api/me", auth, async (req, res) => {
-  const user = await User.findById(req.user.sub).select("_id email name createdAt updatedAt");
-  res.json({ user });
+// ===== المزامنة =====
+// push: يستقبل { data: <DB كامل> } ويخزنه للمستخدم
+app.post("/data/push", auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const payload = req.body || {};
+    if (!payload || typeof payload !== "object") {
+      return res.status(400).json({ error: "بيانات غير صالحة" });
+    }
+
+    const snap = await Snapshot.findOneAndUpdate(
+      { userId },
+      { $set: { data: payload.data || {} } },
+      { new: true, upsert: true }
+    );
+
+    res.json({ ok: true, updatedAt: snap.updatedAt });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "فشل حفظ البيانات" });
+  }
 });
 
-// أمثلة فواتير مرتبطة بالمستخدم
-app.get("/api/invoices", auth, async (req, res) => {
-  const items = await Invoice.find({ userId: req.user.sub }).sort({ createdAt: -1 });
-  res.json({ items });
+// pull: يعيد آخر نسخة محفوظة
+app.get("/data/pull", auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const snap = await Snapshot.findOne({ userId });
+    res.json({ ok: true, data: snap ? snap.data : null, updatedAt: snap ? snap.updatedAt : null });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "فشل جلب البيانات" });
+  }
 });
 
-app.post("/api/invoices", auth, async (req, res) => {
-  const { title, amount, month, notes } = req.body || {};
-  const inv = await Invoice.create({ userId: req.user.sub, title, amount, month, notes });
-  res.status(201).json({ item: inv });
-});
-
-app.delete("/api/invoices/:id", auth, async (req, res) => {
-  const { id } = req.params;
-  await Invoice.deleteOne({ _id: id, userId: req.user.sub });
-  res.json({ ok: true });
-});
-
-// ---------- تشغيل ----------
-const PORT = Number(process.env.PORT || 8080);
+// ===== تشغيل الخادم =====
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(`✅ السيرفر شغال على http://localhost:${PORT}`);
+  console.log("✅ Server running on port", PORT);
 });
